@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { RemoteFileSystemProvider, parseUri } from '../core/remoteFileSystemProvider';
+import { RemoteFileSystemProvider, VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME } from '../consts';
 import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
@@ -194,6 +194,49 @@ export class CompileManager {
         return uri;
     }
 
+    private async resolveRootDocId(vfs: VirtualFileSystem, preferredUri: vscode.Uri) {
+        // Prefer the current document when it is itself a complete LaTeX entry
+        // point. This preserves the existing "compile another root file" behavior.
+        try {
+            const preferredFile = await vfs._resolveUri(preferredUri);
+            if (preferredFile.fileId) {
+                const content = new TextDecoder().decode(await vfs.openFile(preferredUri));
+                if (documentClassRegex.test(content)) {
+                    return preferredFile.fileId;
+                }
+            }
+        } catch {
+            // The initial compile can run before an editor is restored, in which
+            // case preferredUri is the project folder rather than a document.
+        }
+
+        // Use the server-configured root document when the socket payload exposes
+        // it. Some current overleaf.com payloads omit that id, so this may be empty.
+        const configuredRootPath = vfs.getRootDocName();
+        if (configuredRootPath) {
+            const configuredRoot = await vfs._resolveUri(vfs.pathToUri(configuredRootPath));
+            if (configuredRoot.fileId) {
+                return configuredRoot.fileId;
+            }
+        }
+
+        // Fall back to the first project document containing \documentclass.
+        // This lets saves from included files compile the real project root even
+        // when rootDoc_id is absent from the server payload.
+        for (const candidate of vfs.getValidMainDocs()) {
+            try {
+                const candidateUri = vfs.pathToUri(candidate.path);
+                const content = new TextDecoder().decode(await vfs.openFile(candidateUri));
+                if (documentClassRegex.test(content)) {
+                    return candidate.entity._id;
+                }
+            } catch {
+                // Keep searching if an individual candidate cannot be loaded.
+            }
+        }
+        return undefined;
+    }
+
     async compile(force:boolean=false) {
         if (this.inCompiling) { return; }
         await vscode.workspace.saveAll(); // save all dirty files
@@ -202,10 +245,7 @@ export class CompileManager {
         if (uri) {
             this.vfsm.prefetch(uri)
                 .then(async (vfs) => {
-                    const content = new TextDecoder().decode( await vfs?.openFile(uri) );
-                    const match = RegExp(documentClassRegex).exec(content);
-                    const fileId = (await vfs._resolveUri(uri)).fileId;
-                    const rootDocId = match ? fileId : undefined;
+                    const rootDocId = await this.resolveRootDocId(vfs, uri);
                     return await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
                 })
                 .then(async (res) => {
@@ -241,6 +281,30 @@ export class CompileManager {
                     );
                 });
 
+        }
+    }
+
+    private async compileSavedDocument(document: vscode.TextDocument, force:boolean=false) {
+        const uri = await CompileManager.check(document.uri);
+        const vfs = uri && await this.vfsm.prefetch(uri);
+        const compileCondition = vscode.workspace.getConfiguration(`${ROOT_NAME}.compileOnSave`).get('enabled', true);
+        const postfixCondition = document.fileName.match(/\.tex$|\.sty$|\.cls$|\.bib$/i);
+        if (compileCondition && postfixCondition && vfs?.isInvisibleMode===false) {
+            await this.compile(force);
+        }
+    }
+
+    private async saveAndCompile() {
+        const document = vscode.window.activeTextEditor?.document;
+        const hadUnsavedChanges = document?.isDirty ?? false;
+
+        await vscode.commands.executeCommand('workbench.action.files.save');
+
+        // A clean document does not emit onDidSaveTextDocument when Cmd+S is
+        // pressed, so explicitly force a compile. Dirty documents continue
+        // through the normal save listener below, which avoids compiling twice.
+        if (document && !hadUnsavedChanges) {
+            await this.compileSavedDocument(document, true);
         }
     }
 
@@ -450,6 +514,7 @@ export class CompileManager {
             this.status,
             // register compile commands
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.compile`, () => this.compile(true)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.saveAndCompile`, () => this.saveAndCompile()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.viewPdf`, () =>  this.openPdf()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncCode`, () => this.syncCode()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.syncPdf`, (r) => this.syncPdf(r)),
@@ -458,13 +523,7 @@ export class CompileManager {
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setRootDoc`, () => this.setRootDoc()),
             // register compile conditions
             vscode.workspace.onDidSaveTextDocument(async (e) => {
-                const uri = await CompileManager.check.bind(this)(e.uri);
-                const vfs = uri && await this.vfsm.prefetch(uri);
-                const compileCondition = vscode.workspace.getConfiguration(`${ROOT_NAME}.compileOnSave`).get('enabled', true);
-                const postfixCondition = e.fileName.match(/\.tex$|\.sty$|\.cls$|\.bib$/i);
-                if (compileCondition && postfixCondition && vfs?.isInvisibleMode===false) {
-                    this.compile();
-                }
+                await this.compileSavedDocument(e);
             }),
             EventBus.on('compilerUpdateEvent', () => {
                 this.compile(true);

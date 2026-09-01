@@ -39,6 +39,7 @@
     "commands.projectSCM.configSCM.title": "Configure Source Control ...",
 
     "commands.compileManager.compile.title": "Compile Project",
+    "commands.compileManager.saveAndCompile.title": "Save and Compile Project",
     "commands.compileManager.viewPdf.title": "View Compiled PDF",
     "commands.compileManager.syncCode.title": "Jump to PDF",
     "commands.compileManager.setCompiler.title": "Set Compiler",

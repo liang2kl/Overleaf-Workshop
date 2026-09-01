@@ -2,7 +2,7 @@
   "name": "overleaf-workshop",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.10",
+  "version": "0.15.11-pr419cmds.3",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -346,6 +346,12 @@
         "category": "%extension.displayName%"
       },
       {
+        "command": "overleaf-workshop.compileManager.saveAndCompile",
+        "title": "%commands.compileManager.saveAndCompile.title%",
+        "enablement": "editorTextFocus && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname =~ /\\.(tex|sty|cls|bib)$/i",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.compileManager.viewPdf",
         "title": "%commands.compileManager.viewPdf.title%",
         "icon": "$(open-preview)",
@@ -396,6 +402,12 @@
       }
     ],
     "keybindings": [
+      {
+        "key": "ctrl+s",
+        "mac": "cmd+s",
+        "command": "overleaf-workshop.compileManager.saveAndCompile",
+        "when": "editorTextFocus && config.overleaf-workshop.compileOnSave.enabled && (resourceScheme == overleaf-workshop || overleaf-workshop.activateCompile) && resourceExtname =~ /\\.(tex|sty|cls|bib)$/i"
+      },
       {
         "key": "ctrl+alt+b",
         "mac": "cmd+alt+b",
