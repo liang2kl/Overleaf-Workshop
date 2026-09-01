@@ -40,6 +40,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private baseCache: {[key:string]: Uint8Array} = {};
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
+    private syncQueue: Promise<void> = Promise.resolve();
+    private localSyncTimers: Map<string, NodeJS.Timeout> = new Map();
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -288,7 +290,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
         this.status = {status: action, message: `${type}: ${relPath}`};
 
-        await (async () => {
+        try {
             if (type==='delete') {
                 const newContent = undefined;
                 if (this.bypassSync(action, type, relPath, newContent)) { return; }
@@ -302,39 +304,86 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     await vscode.workspace.fs.createDirectory(toUri);
                 }
                 else if (stat.type===vscode.FileType.File) {
-                    try {
-                        const newContent = await vscode.workspace.fs.readFile(fromUri);
-                        if (this.bypassSync(action, type, relPath, newContent)) { return; }
-                        await vscode.workspace.fs.writeFile(toUri, newContent);
-                        this.baseCache[relPath] = newContent;
-                        if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
-                    } catch (error) {
-                        console.error(error);
-                    }
+                    const newContent = await vscode.workspace.fs.readFile(fromUri);
+                    if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                    await vscode.workspace.fs.writeFile(toUri, newContent);
+                    this.baseCache[relPath] = newContent;
+                    if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
                 }
                 else {
                     console.error(`Unknown file type: ${stat.type}`);
                 }
             }
-        })();
-
-        this.status = {status: 'idle', message: ''};
+        } catch (error) {
+            console.error(error);
+            this.status = {status: 'need-attention', message: `${type}: ${relPath}`};
+            throw error;
+        } finally {
+            // A bypassed echo is still a completed operation. Keep an actual
+            // failure visible instead of optimistically reporting "Synced".
+            if (this.status.status===action) {
+                this.status = {status: 'idle', message: ''};
+            }
+        }
     }
 
-    private async syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete') {
+    /**
+     * Serialize local and remote operations. VFS writes emit watcher events of
+     * their own, and running those callbacks concurrently can otherwise let an
+     * older pull overwrite a newer local edit.
+     */
+    private enqueueSync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri): Promise<void> {
+        const queued = this.syncQueue
+            .catch(() => undefined)
+            .then(() => this.applySync(action, type, relPath, fromUri, toUri));
+        this.syncQueue = queued;
+        // Event listeners do not observe rejected promises. applySync already
+        // reports the failure through the SCM status, so consume it here.
+        return queued.catch(() => undefined);
+    }
+
+    private async syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete'): Promise<void> {
         const {pathParts} = parseUri(vfsUri);
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
         const relPath = ('/' + pathParts.join('/'));
         const localUri = vscode.Uri.joinPath(this.baseUri, relPath);
-        this.applySync('pull', type, relPath, vfsUri, localUri);
+        await this.enqueueSync('pull', type, relPath, vfsUri, localUri);
     }
 
-    private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
+    private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete'): Promise<void> {
         // get relative path to baseUri
         const basePath = this.baseUri.path;
         const relPath = localUri.path.slice(basePath.length);
         const vfsUri = this.vfs.pathToUri(relPath);
-        this.applySync('push', type, relPath, localUri, vfsUri);
+        await this.enqueueSync('push', type, relPath, localUri, vfsUri);
+    }
+
+    /**
+     * External editors frequently save atomically by replacing a file. VS Code
+     * can report that as a rapid delete/create/change burst. Debounce the path
+     * and inspect its final state so only the final operation reaches Overleaf.
+     */
+    private scheduleLocalSync(localUri: vscode.Uri) {
+        const key = localUri.toString();
+        const previous = this.localSyncTimers.get(key);
+        if (previous!==undefined) { clearTimeout(previous); }
+
+        const timer = setTimeout(async () => {
+            this.localSyncTimers.delete(key);
+            let type: 'update'|'delete' = 'update';
+            try {
+                await vscode.workspace.fs.stat(localUri);
+            } catch (error) {
+                if ((error as vscode.FileSystemError).code!=='FileNotFound') {
+                    console.error(error);
+                    this.status = {status: 'need-attention', message: `update: ${localUri.path}`};
+                    return;
+                }
+                type = 'delete';
+            }
+            await this.syncToVFS(localUri, type);
+        }, 250);
+        this.localSyncTimers.set(key, timer);
     }
 
     /**
@@ -383,7 +432,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // rely on external tools can opt into file-system change events instead.
         // Keep these listeners mutually exclusive so an editor save is not pushed twice.
         const localChangeListener = syncOnFileChange
-            ? this.localWatcher.onDidChange(async uri => await this.syncToVFS(uri, 'update'))
+            ? this.localWatcher.onDidChange(uri => this.scheduleLocalSync(uri))
             : vscode.workspace.onDidSaveTextDocument(doc => this.onDocumentSaved(doc));
 
         return [
@@ -394,8 +443,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // sync from local to vfs: file updates use the configured listener above;
             // file creation and deletion still always use the file-system watcher
             localChangeListener,
-            this.localWatcher.onDidCreate(async uri => await this.syncToVFS(uri, 'update')),
-            this.localWatcher.onDidDelete(async uri => await this.syncToVFS(uri, 'delete')),
+            this.localWatcher.onDidCreate(uri => this.scheduleLocalSync(uri)),
+            this.localWatcher.onDidDelete(uri => this.scheduleLocalSync(uri)),
+            new vscode.Disposable(() => {
+                this.localSyncTimers.forEach(timer => clearTimeout(timer));
+                this.localSyncTimers.clear();
+            }),
         ];
     }
 
