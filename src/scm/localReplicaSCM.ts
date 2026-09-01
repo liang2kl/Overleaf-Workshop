@@ -216,6 +216,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }, async (progress, token) => {
             // breadth-first search for the files
             const files: [string,string][] = [];
+            const remotePaths = new Set<string>();
             const queue: string[] = [root];
             while (queue.length!==0) {
                 const nextRoot = queue.shift();
@@ -228,6 +229,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     if (this.matchIgnorePatterns(relPath)) {
                         continue;
                     }
+                    remotePaths.add(relPath);
                     if (type === vscode.FileType.Directory) {
                         queue.push(relPath+'/');
                     } else {
@@ -267,6 +269,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         await vscode.workspace.fs.writeFile(vfsUri, mergedContent);
                     }
                 }
+            }
+
+            // Files created while the extension was stopped, reloading, or
+            // recovering from a failed upload do not produce watcher events.
+            // Discover those local-only paths once startup reconciliation has
+            // pulled the remote tree. Directories are traversed before files so
+            // nested local additions can be created remotely in order.
+            const localOnlyPaths: vscode.Uri[] = [];
+            const localQueue: vscode.Uri[] = [this.baseUri];
+            while (localQueue.length!==0) {
+                const localRoot = localQueue.shift()!;
+                const items = await vscode.workspace.fs.readDirectory(localRoot);
+                if (token.isCancellationRequested) { return false; }
+                for (const [name, type] of items) {
+                    const localUri = vscode.Uri.joinPath(localRoot, name);
+                    const relPath = localUri.path.slice(this.baseUri.path.length);
+                    if (this.matchIgnorePatterns(relPath)) { continue; }
+                    if (type === vscode.FileType.Directory) {
+                        localQueue.push(localUri);
+                    }
+                    if (!remotePaths.has(relPath)) {
+                        localOnlyPaths.push(localUri);
+                    }
+                }
+            }
+
+            for (const localUri of localOnlyPaths) {
+                if (token.isCancellationRequested) { return false; }
+                const relPath = localUri.path.slice(this.baseUri.path.length);
+                progress.report({message: relPath});
+                await this.syncToVFS(localUri, 'update');
             }
 
             return true;
