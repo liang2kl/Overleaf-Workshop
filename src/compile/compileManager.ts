@@ -290,6 +290,10 @@ export class CompileManager {
         const compileCondition = vscode.workspace.getConfiguration(`${ROOT_NAME}.compileOnSave`).get('enabled', true);
         const postfixCondition = document.fileName.match(/\.tex$|\.sty$|\.cls$|\.bib$/i);
         if (compileCondition && postfixCondition && vfs?.isInvisibleMode===false) {
+            // A local replica save and this compile listener are independent VS
+            // Code events. Explicitly wait for the local content to reach the
+            // remote VFS, otherwise the build consistently uses the prior save.
+            await LocalReplicaSCMProvider.syncDocument(document.uri);
             await this.compile(force);
         }
     }

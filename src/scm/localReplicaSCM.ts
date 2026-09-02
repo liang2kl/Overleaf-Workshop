@@ -34,6 +34,8 @@ function hashCode(content?: Uint8Array): number {
 export class LocalReplicaSCMProvider extends BaseSCM {
     public static readonly label = vscode.l10n.t('Local Replica');
 
+    private static activeProviders: Set<LocalReplicaSCMProvider> = new Set();
+
     public readonly iconPath: vscode.ThemeIcon = new vscode.ThemeIcon('folder-library');
 
     private bypassCache: Map<string, [FileCache,FileCache]> = new Map();
@@ -365,14 +367,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      * their own, and running those callbacks concurrently can otherwise let an
      * older pull overwrite a newer local edit.
      */
-    private enqueueSync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri): Promise<void> {
+    private enqueueSync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri, propagateError=false): Promise<void> {
         const queued = this.syncQueue
             .catch(() => undefined)
             .then(() => this.applySync(action, type, relPath, fromUri, toUri));
-        this.syncQueue = queued;
+        const settled = queued.catch(() => undefined);
+        this.syncQueue = settled;
         // Event listeners do not observe rejected promises. applySync already
         // reports the failure through the SCM status, so consume it here.
-        return queued.catch(() => undefined);
+        return propagateError ? queued : settled;
     }
 
     private async syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete'): Promise<void> {
@@ -383,12 +386,28 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await this.enqueueSync('pull', type, relPath, vfsUri, localUri);
     }
 
-    private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete'): Promise<void> {
+    private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete', propagateError=false): Promise<void> {
         // get relative path to baseUri
         const basePath = this.baseUri.path;
         const relPath = localUri.path.slice(basePath.length);
         const vfsUri = this.vfs.pathToUri(relPath);
-        await this.enqueueSync('push', type, relPath, localUri, vfsUri);
+        await this.enqueueSync('push', type, relPath, localUri, vfsUri, propagateError);
+    }
+
+    /**
+     * Push a local document and resolve only after Overleaf has accepted it.
+     * Compile-on-save uses this barrier because VS Code does not await other
+     * onDidSaveTextDocument listeners before starting the next listener.
+     */
+    public static async syncDocument(localUri: vscode.Uri): Promise<boolean> {
+        if (localUri.scheme!=='file') { return false; }
+        const provider = [...LocalReplicaSCMProvider.activeProviders].find(candidate => {
+            const basePath = candidate.baseUri.path.endsWith('/') ? candidate.baseUri.path : candidate.baseUri.path + '/';
+            return localUri.path.startsWith(basePath);
+        });
+        if (provider===undefined) { return false; }
+        await provider.syncToVFS(localUri, 'update', true);
+        return true;
     }
 
     /**
@@ -434,6 +453,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private async initWatch() {
+        LocalReplicaSCMProvider.activeProviders.add(this);
         // write ".overleaf/settings.json" if not exist
         const settingUri = vscode.Uri.joinPath(this.baseUri, '.overleaf/settings.json');
         try {
@@ -481,6 +501,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             new vscode.Disposable(() => {
                 this.localSyncTimers.forEach(timer => clearTimeout(timer));
                 this.localSyncTimers.clear();
+            }),
+            new vscode.Disposable(() => {
+                LocalReplicaSCMProvider.activeProviders.delete(this);
             }),
         ];
     }
