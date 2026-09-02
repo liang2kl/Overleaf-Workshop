@@ -836,8 +836,22 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (fileType && fileType==='doc' && fileEntity) {
             const doc = fileEntity as DocumentEntity;
             const _content = new TextDecoder().decode(content);
+
+            const rejoinDocument = async () => {
+                const rejoin = await this.socket.joinDoc(doc._id);
+                const remote = rejoin.docLines.join('\n');
+                doc.version = rejoin.version;
+                doc.lastVersion = rejoin.version;
+                doc.remoteCache = remote;
+                doc.localCache = remote;
+                doc.mtime = undefined;
+            };
+
+            // A version mismatch from another client deliberately invalidates these
+            // caches. Previously a subsequent local write returned successfully here,
+            // silently discarding it. Rejoin the document before constructing the OT op.
             if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
-                return;
+                await rejoinDocument();
             }
             // Build the OT update against whatever the caches currently hold, so that a
             // retry after a resync diffs against the server's content, not stale content.
@@ -915,14 +929,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                     // against what the server actually holds and try once more. This also
                     // recovers when the real-time session was dropped underneath us.
                     try {
-                        const rejoin = await this.socket.joinDoc(doc._id);
-                        const remote = rejoin.docLines.join('\n');
-                        doc.version = rejoin.version;
-                        doc.lastVersion = rejoin.version;
-                        doc.remoteCache = remote;
-                        doc.localCache = remote;
-                        doc.mtime = undefined;
-                    } catch {
+                        await rejoinDocument();
+                    } catch (rejoinError) {
+                        lastError = rejoinError;
                         break;
                     }
                 }

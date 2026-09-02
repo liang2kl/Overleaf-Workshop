@@ -44,6 +44,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private localWatcher?: vscode.FileSystemWatcher;
     private syncQueue: Promise<void> = Promise.resolve();
     private localSyncTimers: Map<string, NodeJS.Timeout> = new Map();
+    private syncErrors: Map<string, string> = new Map();
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -322,8 +323,36 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return false;
     }
 
+    private recordSyncError(relPath: string, error: unknown) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const previous = this.syncErrors.get(relPath);
+        this.syncErrors.set(relPath, detail);
+
+        // shouldPropagate records content before the write is attempted. Remove that
+        // optimistic entry so saving unchanged content retries a failed operation.
+        this.bypassCache.delete(relPath);
+        this.status = {status: 'need-attention', message: `${relPath}: ${detail}`};
+
+        // Avoid notification storms while still making a new failure visible.
+        if (previous!==detail) {
+            vscode.window.showErrorMessage(
+                vscode.l10n.t('Overleaf sync failed for {0}: {1}', relPath, detail)
+            );
+        }
+    }
+
+    private finishSyncStatus(action: 'push'|'pull') {
+        const failed = this.syncErrors.entries().next().value as [string,string] | undefined;
+        if (failed!==undefined) {
+            this.status = {status: 'need-attention', message: `${failed[0]}: ${failed[1]}`};
+        } else if (this.status.status===action) {
+            this.status = {status: 'idle', message: ''};
+        }
+    }
+
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
         this.status = {status: action, message: `${type}: ${relPath}`};
+        let applied = false;
 
         try {
             if (type==='delete') {
@@ -331,12 +360,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (this.bypassSync(action, type, relPath, newContent)) { return; }
                 delete this.baseCache[relPath];
                 await vscode.workspace.fs.delete(toUri, {recursive:true});
+                applied = true;
             } else {
                 const stat = await vscode.workspace.fs.stat(fromUri);
                 if (stat.type===vscode.FileType.Directory) {
                     const newContent = new Uint8Array();
                     if (this.bypassSync(action, type, relPath, newContent)) { return; }
                     await vscode.workspace.fs.createDirectory(toUri);
+                    applied = true;
                 }
                 else if (stat.type===vscode.FileType.File) {
                     const newContent = await vscode.workspace.fs.readFile(fromUri);
@@ -344,21 +375,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     await vscode.workspace.fs.writeFile(toUri, newContent);
                     this.baseCache[relPath] = newContent;
                     if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
+                    applied = true;
                 }
                 else {
-                    console.error(`Unknown file type: ${stat.type}`);
+                    throw new Error(`Unknown file type: ${stat.type}`);
                 }
             }
+            if (applied) { this.syncErrors.delete(relPath); }
         } catch (error) {
             console.error(error);
-            this.status = {status: 'need-attention', message: `${type}: ${relPath}`};
+            this.recordSyncError(relPath, error);
             throw error;
         } finally {
-            // A bypassed echo is still a completed operation. Keep an actual
-            // failure visible instead of optimistically reporting "Synced".
-            if (this.status.status===action) {
-                this.status = {status: 'idle', message: ''};
-            }
+            this.finishSyncStatus(action);
         }
     }
 
@@ -428,7 +457,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch (error) {
                 if ((error as vscode.FileSystemError).code!=='FileNotFound') {
                     console.error(error);
-                    this.status = {status: 'need-attention', message: `update: ${localUri.path}`};
+                    const relPath = localUri.path.slice(this.baseUri.path.length);
+                    this.recordSyncError(relPath, error);
                     return;
                 }
                 type = 'delete';
